@@ -4,6 +4,7 @@
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from nnsight import LanguageModel
 from datasets import load_dataset
 import os
 device = "cuda"
@@ -14,18 +15,20 @@ os.environ["HF_TOKEN"] = "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"
 use_wandb = True
 
 # %%
-base_model = AutoModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-3.1-8B",
-    device_map=device,
-    torch_dtype=torch.bfloat16,
-)
+# base_model = AutoModelForCausalLM.from_pretrained(
+#     "meta-llama/Llama-3.1-8B",
+#     device_map=device,
+#     torch_dtype=torch.bfloat16,
+# )
+base_model = LanguageModel("meta-llama/Llama-3.1-8B", device_map=device, torch_dtype=torch.bfloat16)
 base_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
 
-r1_model = AutoModelForCausalLM.from_pretrained(
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
-    device_map=device,
-    torch_dtype=torch.bfloat16,
-)
+# r1_model = AutoModelForCausalLM.from_pretrained(
+#     "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+#     device_map=device,
+#     torch_dtype=torch.bfloat16,
+# )
+r1_model = LanguageModel("deepseek-ai/DeepSeek-R1-Distill-Llama-8B", device_map=device, torch_dtype=torch.bfloat16)
 r1_tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
 # %%
 dataset = load_dataset(
@@ -74,7 +77,7 @@ scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=1000)
 if use_wandb:
     run = wandb.init(
         project="llama-crosscoder",
-        name=f"crosscoder-layer{layer_num}_{n_features}_{k}",
+        name=f"crosscoder-layer{layer_num}_{n_features}_{k}_multictx",
     )
 latent_tracker = LatentTracker(
     n_features,
@@ -83,7 +86,7 @@ latent_tracker = LatentTracker(
 )
 
 # %%
-from data_utils import cached_activation_generator
+from data_utils import cached_activation_generator, new_cached_activation_generator
 from tqdm import tqdm
 import torch.nn.functional as F
 
@@ -91,27 +94,42 @@ import torch.nn.functional as F
 num_tokens_to_train = 400_000_000
 virtual_batch_size = 8192
 actual_batch_size = 256
-ctx_len = 1024
+# ctx_len = 1024
+tokens_per_example = 1024
 skip_first_n_tokens = 1  # skip BOS (some neurons have crazy high activations > 300)
-tokens_per_batch = virtual_batch_size * (ctx_len - skip_first_n_tokens)
+# tokens_per_batch = virtual_batch_size * (ctx_len - skip_first_n_tokens)
 accumulation_steps = virtual_batch_size // actual_batch_size
 num_optimizer_steps = num_tokens_to_train // virtual_batch_size
 total_forward_passes = num_optimizer_steps * accumulation_steps
 alpha = 1/32
 crosscoder_path = f"crosscoder-layer{layer_num}_{n_features}_{k}.pt"
 
-my_data_generator = cached_activation_generator(
+# my_data_generator = cached_activation_generator(
+#     base_model=base_model,
+#     finetune_model=r1_model,
+#     base_tokenizer=base_tokenizer,
+#     finetune_tokenizer=r1_tokenizer,
+#     dataset=dataset,
+#     layer_num=layer_num,
+#     activation_batch_size=actual_batch_size,
+#     generator_batch_size=16,
+#     acts_per_run=100_000,
+#     ctx_len=ctx_len,
+#     skip_first_n_tokens=skip_first_n_tokens,
+# )
+
+my_data_generator = new_cached_activation_generator(
     base_model=base_model,
     finetune_model=r1_model,
     base_tokenizer=base_tokenizer,
     finetune_tokenizer=r1_tokenizer,
     dataset=dataset,
-    layer_num=layer_num,
+    layer_num=11,
     activation_batch_size=actual_batch_size,
     generator_batch_size=16,
-    acts_per_run=100_000,
-    ctx_len=ctx_len,
-    skip_first_n_tokens=skip_first_n_tokens,
+    acts_per_run=100_000,  # Combined parameter (was examples_per_run and max_acts_per_file)
+    tokens_per_example=tokens_per_example,
+    skip_first_n_tokens=1,
 )
 
 # %%
