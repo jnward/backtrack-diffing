@@ -2,7 +2,7 @@ import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import DatasetDict, Dataset, IterableDatasetDict, IterableDataset
-
+from nnsight import LanguageModel
 from typing import Union
 
 from pathlib import Path
@@ -59,6 +59,107 @@ def token_iter(
             base_batch = []
             finetune_batch = []
 
+# def get_tokenized_contexts(
+#     base_tokenizer: AutoTokenizer,
+#     finetune_tokenizer: AutoTokenizer,
+#     dataset: Dataset | IterableDataset,
+#     tokens_per_example: int,
+#     batch_size: int,
+#     max_ctx_len: int | None = None,
+# ):
+#     row_len = 0
+#     current_row = 0
+#     base_out = torch.zeros(batch_size, tokens_per_example, dtype=torch.int64)
+#     finetune_out = torch.zeros(batch_size, tokens_per_example, dtype=torch.int64)
+#     # Add a list to track context start positions for each row
+#     context_starts = [[] for _ in range(batch_size)]
+#     attn_mask = torch.ones(batch_size, 1, tokens_per_example, tokens_per_example, dtype=torch.float) * float("-inf")
+#     for example in dataset:
+#         messages = example["messages"]
+#         finetune_tokens = finetune_tokenizer.apply_chat_template(messages, return_tensors="pt")
+#         if max_ctx_len is not None:
+#             finetune_tokens = finetune_tokens[0, :max_ctx_len]
+#         else:
+#             finetune_tokens = finetune_tokens[0, :]
+#         base_tokens = convert_to_base_tokens(finetune_tokens)
+#         if not verify_base_tokens(base_tokens, base_tokenizer):
+#             continue
+#         context_starts[current_row].append(row_len)
+#         remaining_space = tokens_per_example - row_len
+#         base_tokens = base_tokens[:remaining_space]
+#         finetune_tokens = finetune_tokens[:remaining_space]
+#         base_out[current_row, row_len:row_len + base_tokens.shape[0]] = base_tokens
+#         finetune_out[current_row, row_len:row_len + finetune_tokens.shape[0]] = finetune_tokens
+#         row_len += finetune_tokens.shape[0]
+#         assert row_len <= tokens_per_example
+        
+#         if row_len == tokens_per_example:
+#             current_row += 1
+#             row_len = 0
+#             if current_row == batch_size:
+#                 yield base_out, finetune_out, context_starts, attn_mask
+#                 base_out = torch.zeros(batch_size, tokens_per_example, dtype=torch.float)
+#                 finetune_out = torch.zeros(batch_size, tokens_per_example, dtype=torch.float)
+#                 context_starts = [[] for _ in range(batch_size)]
+#                 current_row = 0
+
+
+def tokenized_context_iter(
+    base_tokenizer: AutoTokenizer,
+    finetune_tokenizer: AutoTokenizer,
+    dataset: Dataset | IterableDataset,
+    tokens_per_example: int,
+    batch_size: int,
+    max_ctx_len: int | None = None,
+):
+    row_len = 0
+    current_row = 0
+    base_out = torch.zeros(batch_size, tokens_per_example, dtype=torch.int64)
+    finetune_out = torch.zeros(batch_size, tokens_per_example, dtype=torch.int64)
+    context_starts = [[] for _ in range(batch_size)]
+    attn_mask = torch.ones(batch_size, 1, tokens_per_example, tokens_per_example, dtype=torch.float) * float("-inf")
+    
+    for example in dataset:
+        messages = example["messages"]
+        finetune_tokens = finetune_tokenizer.apply_chat_template(messages, return_tensors="pt")
+        if max_ctx_len is not None:
+            finetune_tokens = finetune_tokens[0, :max_ctx_len]
+        else:
+            finetune_tokens = finetune_tokens[0, :]
+        base_tokens = convert_to_base_tokens(finetune_tokens)
+        if not verify_base_tokens(base_tokens, base_tokenizer):
+            continue
+            
+        context_starts[current_row].append(row_len)
+        remaining_space = tokens_per_example - row_len
+        base_tokens = base_tokens[:remaining_space]
+        finetune_tokens = finetune_tokens[:remaining_space]
+        
+        # Get the context length
+        ctx_length = finetune_tokens.shape[0]
+        
+        # Create a lower triangular mask (causal mask) for this context
+        causal_block = torch.tril(torch.ones(ctx_length, ctx_length, dtype=torch.bool))
+        
+        # Update the attention mask (setting 0.0 where attention is allowed)
+        attn_mask[current_row, 0, row_len:row_len+ctx_length, row_len:row_len+ctx_length].masked_fill_(causal_block, 0.0)
+        
+        base_out[current_row, row_len:row_len + base_tokens.shape[0]] = base_tokens
+        finetune_out[current_row, row_len:row_len + finetune_tokens.shape[0]] = finetune_tokens
+        row_len += finetune_tokens.shape[0]
+        assert row_len <= tokens_per_example
+        
+        if row_len == tokens_per_example:
+            current_row += 1
+            row_len = 0
+            if current_row == batch_size:
+                yield base_out, finetune_out, context_starts, attn_mask
+                base_out = torch.zeros(batch_size, tokens_per_example, dtype=torch.int64)
+                finetune_out = torch.zeros(batch_size, tokens_per_example, dtype=torch.int64)
+                context_starts = [[] for _ in range(batch_size)]
+                attn_mask = torch.ones(batch_size, 1, tokens_per_example, tokens_per_example, dtype=torch.float) * float("-inf")
+                current_row = 0
+
 
 @torch.no_grad()
 def get_activations(
@@ -68,6 +169,19 @@ def get_activations(
         outputs = model.forward(token_batch, output_hidden_states=True)
         activations = outputs.hidden_states[layer_num]
     return activations
+
+@torch.no_grad()
+def get_activations_nnsight(
+    model: LanguageModel,
+    token_batch: torch.Tensor,
+    attn_mask: torch.Tensor,
+    layer_num: int,
+):
+    # row = {"input_ids": token_batch, "attention_mask": attn_mask}
+    row = {"input_ids": token_batch}
+    with model.trace(row) as trace:
+        outputs = model.model.layers[layer_num].output[0].save()
+    return outputs
 
 def _save_activations_to_disk(activations_list, save_dir, file_idx, skip_first_n_tokens):
     """
@@ -92,6 +206,97 @@ def _save_activations_to_disk(activations_list, save_dir, file_idx, skip_first_n
     torch.save(acts_cat, save_path)
     return acts_cat.size(0)  # Return count for logging
 
+
+def get_desired_activation_indices(context_starts: list[list[int]], tokens_per_example: int, skip_first_n_tokens: int):
+    # First, flatten context_starts with proper batch offsets
+    flat_context_starts = []
+    for batch_idx, starts in enumerate(context_starts):
+        batch_offset = batch_idx * tokens_per_example
+        for start in starts:
+            flat_context_starts.append(batch_offset + start)
+    
+    # Create a set of all positions to exclude
+    exclude_positions = set()
+    for start in flat_context_starts:
+        for i in range(skip_first_n_tokens):
+            exclude_positions.add(start + i)
+    
+    # Generate all possible indices
+    all_indices = list(range(len(context_starts) * tokens_per_example))
+    
+    # Filter out the excluded positions
+    desired_indices = [idx for idx in all_indices if idx not in exclude_positions]
+    
+    return torch.tensor(desired_indices, dtype=torch.int64)
+
+import time
+def new_cached_activation_generator(
+    base_model: LanguageModel,
+    finetune_model: LanguageModel,
+    base_tokenizer: AutoTokenizer,
+    finetune_tokenizer: AutoTokenizer,
+    dataset: Dataset | IterableDataset,
+    layer_num: int,
+    activation_batch_size: int,
+    generator_batch_size=24,
+    acts_per_run=1_000_000,  # Combined parameter (was examples_per_run and max_acts_per_file)
+    tokens_per_example=128,
+    skip_first_n_tokens=0,
+    device="cuda"
+):
+    """
+    Generate activations and cache them in memory, with optional saving to disk.
+    With the same random seed, this will produce identical files to cache_activations_to_disk.
+    
+    Parameters:
+    - base_model: The base model
+    - finetune_model: The finetuned model
+    - tokenizer: The tokenizer
+    - dataset: Dataset to generate activations from
+    - layer_num: Layer to extract activations from
+    - activation_batch_size: Size of batches yielded to training
+    - generator_batch_size: Size of batches for generating activations
+    - acts_per_run: Maximum activations per run (and per file when saving)
+    - tokens_per_example: Context length for tokenization
+    - skip_first_n_tokens: Number of tokens to skip from the beginning
+    
+    Yields:
+    - Batches of activations for training
+    """
+    data_iter = tokenized_context_iter(base_tokenizer, finetune_tokenizer, dataset, tokens_per_example, generator_batch_size)
+    while True:
+        my_acts = []
+        num_acts = 0
+        # Generate activations for this run
+        while num_acts < acts_per_run:
+            try:
+                base_token_batch, finetune_token_batch, context_starts, attn_mask = next(data_iter)
+                base_token_batch = base_token_batch.to(device)
+                finetune_token_batch = finetune_token_batch.to(device)
+                attn_mask = attn_mask.to(device).to(base_model.dtype)
+                base_activations = get_activations_nnsight(base_model, base_token_batch, attn_mask, layer_num)
+                finetune_activations = get_activations_nnsight(finetune_model, finetune_token_batch, attn_mask, layer_num)
+                desired_activation_indices = get_desired_activation_indices(context_starts, tokens_per_example, skip_first_n_tokens)
+                base_activations = base_activations.view(-1, base_activations.size(-1))
+                finetune_activations = finetune_activations.view(-1, finetune_activations.size(-1))
+                base_activations = base_activations[desired_activation_indices, :]
+                finetune_activations = finetune_activations[desired_activation_indices, :]
+                concatenated_activations_BZ = torch.cat([base_activations, finetune_activations], dim=-1)
+                my_acts.append(concatenated_activations_BZ)
+                num_acts += concatenated_activations_BZ.size(0)
+            except StopIteration:
+                print("Dataset exhausted.")
+                if not my_acts:  # No activations generated
+                    return
+                break
+            
+        # Process activations for training (we use the same permutation as when saving)
+        acts_cat = torch.cat(my_acts, dim=0)
+        randperm = torch.randperm(acts_cat.size(0))
+        acts_cat = acts_cat[randperm]  
+        # Yield batches for training
+        for i in range(0, len(acts_cat), activation_batch_size):
+            yield acts_cat[i : i + activation_batch_size]
 
 def cached_activation_generator(
     base_model: AutoModelForCausalLM,
@@ -135,7 +340,7 @@ def cached_activation_generator(
     tokens_per_batch = generator_batch_size * (ctx_len - skip_first_n_tokens)
     batches_per_run = acts_per_run // tokens_per_batch
 
-    print(f"Generating {batches_per_run} batches per run")
+    print(f"Generating {batches_per_run} batches dper run")
     
     # Set up disk saving if requested
     save_dir = None
