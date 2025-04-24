@@ -128,9 +128,9 @@ def reshape_to_heads(weights):
         new_dict = {}
         
         for key, weight in layer_weight_dict.items():
-            if key in ['q_proj', 'k_proj']:
+            if key == 'q_proj':
                 new_dict[key] = einops.rearrange(weight, "(num_heads d_head) d_model -> num_heads d_head d_model", num_heads=base_model.config.num_attention_heads)
-            elif key == 'v_proj':
+            elif key in ['k_proj', 'v_proj']:
                 new_dict[key] = einops.rearrange(weight, "(num_heads d_head) d_model -> num_heads d_head d_model", num_heads=base_model.config.num_key_value_heads)
             elif key == 'o_proj':
                 new_dict[key] = einops.rearrange(weight, "d_model (num_heads d_head) -> num_heads d_head d_model", num_heads=base_model.config.num_attention_heads)
@@ -260,6 +260,32 @@ fig.update_xaxes(title_text="Head Index", col=4)
 fig.show()
 
 # %%
+#compute rank of each head diff
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# %%
 # Create reshaped versions of base and finetune weights for factored computation
 reshaped_base = reshape_to_heads(base_weights)
 reshaped_finetune = reshape_to_heads(finetune_weights)
@@ -291,15 +317,21 @@ for layer_idx in range(num_layers):
         
         # Compute QK base and finetune matrices and immediately calculate relative norm
         # QK = Q @ K^T
-        base_qk = einops.einsum(
-            base_q, base_k,
-            "qh d_model1, kh d_model2 -> d_model1 d_model2"
-        )
+        # base_qk = einops.einsum(
+        #     base_q, base_k,
+        #     "qh d_model1, kh d_model2 -> d_model1 d_model2"
+        # )
+        # print(base_q.shape, base_k.shape)
+        base_qk = base_q.T @ base_k
+        print(base_qk.shape)
         
-        ft_qk = einops.einsum(
-            ft_q, ft_k,
-            "qh d_model1, kh d_model2 -> d_model1 d_model2"
-        )
+        # ft_qk = einops.einsum(
+        #     ft_q, ft_k,
+        #     "qh d_model1, kh d_model2 -> d_model1 d_model2"
+        # )
+        # ft_qk = ft_q.T @ ft_k.repeat_interleave(4, dim=0)
+        ft_qk = ft_q.T @ ft_k
+        print(ft_qk.shape)
         
         # Calculate diff and norms immediately
         qk_diff = ft_qk - base_qk
@@ -313,15 +345,20 @@ for layer_idx in range(num_layers):
         
         # Compute OV base and finetune matrices and immediately calculate relative norm
         # OV = V @ O^T
-        base_ov = einops.einsum(
-            base_v, base_o,
-            "vh d_model1, oh d_model2 -> d_model1 d_model2"
-        )
-        
-        ft_ov = einops.einsum(
-            ft_v, ft_o,
-            "vh d_model1, oh d_model2 -> d_model1 d_model2"
-        )
+        # base_ov = einops.einsum(
+        #     base_v, base_o,
+        #     "vh d_model1, oh d_model2 -> d_model1 d_model2"
+        # )
+        # print(base_v.shape, base_o.shape)
+        base_ov = base_v.T @ base_o
+        print(base_ov.shape)
+        # ft_ov = einops.einsum(
+        #     ft_v, ft_o,
+        #     "vh d_model1, oh d_model2 -> d_model1 d_model2"
+        # )
+        # ft_ov = ft_v.repeat_interleave(4, dim=0).T @ ft_o
+        ft_ov = ft_v.T @ ft_o
+        print(ft_ov.shape)
         
         # Calculate diff and norms immediately
         ov_diff = ft_ov - base_ov
@@ -373,4 +410,9 @@ fig.update_xaxes(title_text="Head Index", col=1)
 fig.update_xaxes(title_text="Head Index", col=2)
 
 fig.show()
+# %%
+
+print(base_weights[0]["k_proj"].shape)
+base_weights[0]["k_proj"].repeat_interleave(4, dim=0).shape
+
 # %%

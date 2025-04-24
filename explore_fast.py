@@ -80,42 +80,45 @@ def get_logit_diff(logits, answer_token_indices=answer_token_indices):
     incorrect_logits = logits[answer_token_indices[1]]
     return correct_logits - incorrect_logits
 
+BASE_BASELINE = get_logit_diff(logits_b)
+FT_BASELINE = get_logit_diff(logits_ft)
+print(f"Base logit diff: {BASE_BASELINE.item()}")
+print(f"Finetune logit diff: {FT_BASELINE.item()}")
+
+# %%
+def wait_metric(logits, answer_token_indices=answer_token_indices):
+    return (get_logit_diff(logits, answer_token_indices) - FT_BASELINE) / (BASE_BASELINE - FT_BASELINE)
+
+print(f"Base Baseline: {wait_metric(logits_b).item()}")
+print(f"Finetune Baseline: {wait_metric(logits_ft).item()}")
+
 # %%
 base_is_clean = False
+patch_site = "attn_out"  # "residual", "attn_out", "mlp_out"
+
+
 if base_is_clean:
     clean_model = base_model
     corrupted_model = finetune_model
-    clean_logits = logits_b
-    corrupted_logits = logits_ft
     clean_tokens = prompt_tokens_b
     corrupted_tokens = prompt_tokens_ft
 else:
     clean_model = finetune_model
     corrupted_model = base_model
-    clean_logits = logits_ft
-    corrupted_logits = logits_b
     clean_tokens = prompt_tokens_ft
     corrupted_tokens = prompt_tokens_b
-
-CLEAN_BASELINE = get_logit_diff(clean_logits)
-CORRUPTED_BASELINE = get_logit_diff(corrupted_logits)
-print(f"clean logit diff: {CLEAN_BASELINE.item()}")
-print(f"corrupted logit diff: {CORRUPTED_BASELINE.item()}")
-
-# %%
-def wait_metric(logits, answer_token_indices=answer_token_indices):
-    return (get_logit_diff(logits, answer_token_indices) - CORRUPTED_BASELINE) / (CLEAN_BASELINE - CORRUPTED_BASELINE)
-
-# %%
-print(f"clean Baseline: {wait_metric(clean_logits).item()}")
-print(f"corrupted Baseline: {wait_metric(corrupted_logits).item()}")
 
 # %%
 corrupted_out = []
 corrupted_grads = []
 with corrupted_model.trace(corrupted_tokens) as tr:
     for l, layer in enumerate(corrupted_model.model.layers):
-        layer_out = layer.output[0]
+        if patch_site == "residual":
+            layer_out = layer.output[0]
+        elif patch_site == "attn_out":
+            layer_out = layer.self_attn.output[0]
+        elif patch_site == "mlp_out":
+            layer_out = layer.mlp.down_proj.output
         corrupted_out.append(layer_out.save())
         corrupted_grads.append(layer_out.grad.save())
 
@@ -129,7 +132,12 @@ print(corrupted_grads)
 clean_out = []
 with clean_model.trace(clean_tokens) as tr:
     for l, layer in enumerate(clean_model.model.layers):
-        layer_out = layer.output[0]
+        if patch_site == "residual":
+            layer_out = layer.output[0]
+        elif patch_site == "attn_out":
+            layer_out = layer.self_attn.output[0]
+        elif patch_site == "mlp_out":
+            layer_out = layer.mlp.down_proj.output
         clean_out.append(layer_out.save())
 
 # %%
@@ -154,7 +162,7 @@ fig = px.imshow(
     patching_results,
     color_continuous_scale="RdBu",
     color_continuous_midpoint=0,
-    title="Attribution Patching over Token Positions",
+    title=f"Attribution Patching ({'Base into Finetune' if base_is_clean else 'Finetune into Base'}, {patch_site}) over Token Positions",
     labels=dict(x="Token Position", y="Layer", color="Norm. Logit Diff"),
 )
 fig.show()
