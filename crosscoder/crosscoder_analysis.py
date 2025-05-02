@@ -14,11 +14,15 @@ device = "cuda"
 torch.manual_seed(42)
 torch.set_grad_enabled(False)
 
-# %%
-base_model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-Math-1.5B", device_map=device, torch_dtype=torch.bfloat16)
+import os
+os.environ["HF_TOKEN"] = "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"
 
-tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
-r1_model = AutoModelForCausalLM.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", device_map=device, torch_dtype=torch.bfloat16)
+# %%
+base_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
+base_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B", device_map=device, torch_dtype=torch.bfloat16)
+
+r1_tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
+r1_model = AutoModelForCausalLM.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Llama-8B", device_map=device, torch_dtype=torch.bfloat16)
 # %%
 # dataset = load_dataset(
 #     "a-m-team/AM-DeepSeek-R1-Distilled-1.4M",
@@ -35,9 +39,9 @@ dataset = load_dataset(
 dataset = dataset.shuffle(seed=42)
 
 # n_features = 16384
-n_features = 49152
+n_features = 32768
 k = 100
-layer_num = 14
+layer_num = 11
 
 crosscoder = BatchTopKCrosscoder(
     d_model=r1_model.config.hidden_size,
@@ -46,9 +50,8 @@ crosscoder = BatchTopKCrosscoder(
 )
 crosscoder.to(device)
 
-
 # %%
-state_dict = torch.load("crosscoder-layer14_49152_100_fullshuffle_aux.pt")
+state_dict = torch.load("crosscoder-layer11_32768_100.pt")
 crosscoder.load_state_dict(state_dict)
 
 # %%
@@ -73,22 +76,31 @@ from data_utils import cached_activation_generator, token_iter
 # )
 
 my_data_generator = token_iter(
-    tokenizer=tokenizer,
+    base_tokenizer=base_tokenizer,
+    finetune_tokenizer=r1_tokenizer,
     dataset=dataset,
     batch_size=1,
     ctx_len=1024,
 )
 
 example = next(iter(my_data_generator))
-tokenizer.decode(example[0])
+print(base_tokenizer.decode(example[0][0]))
+print(r1_tokenizer.decode(example[1][0]))
+
 # %%
-base_decoder = crosscoder.W_decoder_FZ[:, :1536]
-r1_decoder = crosscoder.W_decoder_FZ[:, 1536:]
+example
+
+
+# %%
+base_decoder = crosscoder.W_decoder_FZ[:, :4096]
+r1_decoder = crosscoder.W_decoder_FZ[:, 4096:]
 
 # %%
 base_decoder.norm(dim=1)
+
 # %%
 r1_decoder.norm(dim=1)
+
 # %%
 norm_diff = r1_decoder.norm(dim=1) - base_decoder.norm(dim=1)
 fig = px.histogram(
@@ -147,35 +159,37 @@ def generate_feature_df(
     base_model,
     r1_model,
     crosscoder: BatchTopKCrosscoder,
-    tokenizer,
     dataset,
-    layer_num,
-    batch_size=16,
-    ctx_len=1024,
+    layer_num = 11,
+    batch_size=1,
+    ctx_len=512,
 ):
     my_data_generator = token_iter(
-        tokenizer=tokenizer,
+        base_tokenizer=base_tokenizer,
+        finetune_tokenizer=r1_tokenizer,
         dataset=dataset,
         batch_size=batch_size,
         ctx_len=ctx_len,
     )
-    for batch in my_data_generator:
-        batch = batch.to(device)
-        base_out = base_model.forward(batch, output_hidden_states=True)
-        r1_out = r1_model.forward(batch, output_hidden_states=True)
-        base_hidden = base_out.hidden_states[14][:, 1:]  # remove BOS
-        r1_hidden = r1_out.hidden_states[14][:, 1:]  # remove BOS
+    for base_batch, r1_batch in my_data_generator:
+        base_batch = base_batch.to(device)
+        r1_batch = r1_batch.to(device)
+        base_out = base_model.forward(base_batch, output_hidden_states=True)
+        r1_out = r1_model.forward(r1_batch, output_hidden_states=True)
+        base_hidden = base_out.hidden_states[layer_num][:, 1:]  # remove BOS
+        r1_hidden = r1_out.hidden_states[layer_num][:, 1:]  # remove BOS
         concat_hidden = torch.cat([base_hidden, r1_hidden], dim=-1)
         flat_hidden = concat_hidden.view(-1, concat_hidden.shape[-1]).float()
         print(concat_hidden.shape)
-        print(batch.shape)
+        print(base_batch.shape)
+        print(r1_batch.shape)
         features = crosscoder.get_latent_activations(flat_hidden)
-        features = features.view(batch.shape[0], -1, features.shape[-1])
+        features = features.view(base_batch.shape[0], -1, features.shape[-1])
         print(features.shape)
-        for i in range(batch.shape[0]):
-            for j in range(batch.shape[1]):
-                token = tokenizer.decode(batch[i, j])
-                ctx = tokenizer.decode(batch[i, j-10:j+10])
+        for i in range(base_batch.shape[0]):
+            for j in range(base_batch.shape[1]):
+                token = base_tokenizer.decode(base_batch[i, j])
+                ctx = base_tokenizer.decode(base_batch[i, j-10:j+10])
                 # print(repr(token), repr(ctx))
         break
 
@@ -183,7 +197,6 @@ generate_feature_df(
     base_model,
     r1_model,
     crosscoder,
-    tokenizer,
     dataset,
     layer_num,
 )
@@ -194,11 +207,10 @@ def track_feature_activations(
     base_model,
     r1_model,
     crosscoder: BatchTopKCrosscoder,
-    tokenizer,
     dataset,
     layer_num,
-    batch_size=16,
-    ctx_len=1024,
+    batch_size=8,
+    ctx_len=512,
     max_examples=10000,
     top_k=10
 ):
@@ -209,8 +221,8 @@ def track_feature_activations(
     activation_counts = np.zeros(crosscoder.dict_size, dtype=int)
     
     # Calculate norms of base and r1 decoder vectors
-    base_decoder = crosscoder.W_decoder_FZ[:, :1536]
-    r1_decoder = crosscoder.W_decoder_FZ[:, 1536:]
+    base_decoder = crosscoder.W_decoder_FZ[:, :4096]
+    r1_decoder = crosscoder.W_decoder_FZ[:, 4096:]
     
     base_norms = base_decoder.norm(dim=1).cpu().numpy()
     r1_norms = r1_decoder.norm(dim=1).cpu().numpy()
@@ -238,7 +250,8 @@ def track_feature_activations(
     
     # Process batches
     my_data_generator = token_iter(
-        tokenizer=tokenizer,
+        base_tokenizer=base_tokenizer,
+        finetune_tokenizer=r1_tokenizer,
         dataset=dataset,
         batch_size=batch_size,
         ctx_len=ctx_len,
@@ -247,12 +260,13 @@ def track_feature_activations(
     pbar = tqdm(total=max_examples, desc="Processing examples")
     examples_processed = 0
     
-    for batch in my_data_generator:
-        batch = batch.to(device)
+    for base_batch, r1_batch in my_data_generator:
+        base_batch = base_batch.to(device)
+        r1_batch = r1_batch.to(device)
         
         # Get hidden states from both models
-        base_out = base_model.forward(batch, output_hidden_states=True)
-        r1_out = r1_model.forward(batch, output_hidden_states=True)
+        base_out = base_model.forward(base_batch, output_hidden_states=True)
+        r1_out = r1_model.forward(r1_batch, output_hidden_states=True)
         
         base_hidden = base_out.hidden_states[layer_num][:, 1:]  # remove BOS
         r1_hidden = r1_out.hidden_states[layer_num][:, 1:]  # remove BOS
@@ -268,20 +282,20 @@ def track_feature_activations(
         features = crosscoder.apply_batchtopk(raw_features.clone())
 
         # Reshape to match the batch shape
-        features = features.view(batch.shape[0], -1, features.shape[-1])
-        raw_features = raw_features.view(batch.shape[0], -1, raw_features.shape[-1])
+        features = features.view(base_batch.shape[0], -1, features.shape[-1])
+        raw_features = raw_features.view(base_batch.shape[0], -1, raw_features.shape[-1])
 
         # Process each token's activations
-        for i in range(batch.shape[0]):
-            for j in range(1, batch.shape[1]):  # Start from 1 to skip BOS token
+        for i in range(base_batch.shape[0]):
+            for j in range(1, base_batch.shape[1]):  # Start from 1 to skip BOS token
                 examples_processed += 1
                 pbar.update(1)
                 
                 # Get token and context
-                token = tokenizer.decode(batch[i, j].item())
+                token = r1_tokenizer.decode(r1_batch[i, j].item())
                 context_start = max(0, j-7)
-                context_end = min(batch.shape[1], j+5)
-                context = tokenizer.decode(batch[i, context_start:context_end].tolist())
+                context_end = min(r1_batch.shape[1], j+5)
+                context = r1_tokenizer.decode(r1_batch[i, context_start:context_end].tolist())
                 
                 # Get activated features for this token
                 token_features = features[i, j-1].nonzero()
@@ -424,9 +438,8 @@ feature_df = track_feature_activations(
     base_model,
     r1_model,
     crosscoder,
-    tokenizer,
     dataset,
-    layer_num=layer_num,
+    layer_num=11,
     batch_size=8,
     max_examples=10000
 )

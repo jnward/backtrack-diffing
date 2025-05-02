@@ -8,7 +8,6 @@ from typing import Dict, List, Tuple
 from datasets import load_dataset, Features, Value
 from data_utils import get_activations, cached_activation_generator
 from crosscoder import BatchTopKCrosscoder
-from nnterp import load_model as nnterp_load_model
 from nnsight.modeling.language import LanguageModel
 
 def load_crosscoder_model(model_path: str) -> BatchTopKCrosscoder:
@@ -61,7 +60,7 @@ def analyze_decoder_norm_diffs(decoder_A: torch.Tensor, decoder_B: torch.Tensor)
 def plot_feature_analysis(results: Dict, output_dir: Path):
     """Create visualizations of the analysis results"""
     # Set the style for all plots
-    plt.style.use('seaborn')
+    # plt.style.use('seaborn')
     
     # Plot decoder norm differences with improved styling
     plt.figure(figsize=(12, 8))
@@ -89,7 +88,8 @@ def plot_feature_analysis(results: Dict, output_dir: Path):
 
 def main():
     # Setup
-    model_path = "crosscoder-layer14.pt"
+    # model_path = "crosscoder-layer14.pt"
+    model_path = "crosscoder-layer11_32768_100.pt"
     output_dir = Path("analysis_results")
     output_dir.mkdir(exist_ok=True)
     
